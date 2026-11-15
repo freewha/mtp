@@ -1,7 +1,9 @@
 import net from "node:net";
 import http from "node:http";
+import https from "node:https";
+import fs from "node:fs";
 import { Readable, Writable } from "node:stream";
-import { webcrypto } from "node:crypto";
+import { webcrypto, X509Certificate } from "node:crypto";
 import { WebSocketServer } from "ws";
 
 // Node 18 only exposes Web Crypto behind a flag; Node 19+ ships it as a global.
@@ -26,7 +28,8 @@ const ENV = process.env;
 const CONFIG_KEYS = [
   "SECRET", "AD_TAG", "DEBUG", "DECOY_URL", "MAX_STREAMS", "SESSION_PATH", "WS_PATH",
   "ADMIN_KEY", "EXTRA_HOSTS", "CARRIER", "GENERATOR_ENABLED", "GENERATOR_KEY", "ACCEPT_GENERATED",
-  "DC_OVERRIDE", "PROXY_PORTS"
+  "DC_OVERRIDE", "PROXY_PORTS",
+  "TLS_CERT", "TLS_KEY", "TLS_CERT_PEM", "TLS_KEY_PEM", "TLS_PORT", "PUBLIC_PORT", "TRUST_PROXY"
 ];
 
 // On Cloudflare the bindings are plain env vars. On a Node host the process
@@ -46,6 +49,15 @@ function buildEnv(source) {
 }
 
 const APP_ENV = buildEnv(process.env);
+
+// Read a single setting from the process environment, preferring the namespaced
+// PROXYGOSHA_ form over the bare one (see buildEnv above for why).
+function envValue(key) {
+  const prefixed = ENV["PROXYGOSHA_" + key];
+  if (typeof prefixed === "string" && prefixed.trim()) return prefixed.trim();
+  const plain = ENV[key];
+  return typeof plain === "string" ? plain.trim() : "";
+}
 
 // Cloudflare's connect() returned a socket object exposing a Web ReadableStream
 // (`readable`) and WritableStream (`writable`). We reproduce the exact same
@@ -361,16 +373,81 @@ const STATS = {
   bytesUp: 0,         // client -> Telegram bytes (approximate)
   bytesDown: 0,       // Telegram -> client bytes (approximate)
   wsRejects: 0,       // WebSocket handshakes rejected (bad/expired token)
+  tlsErrors: 0,       // failed TLS handshakes (bad cert / wrong port / SNI mismatch)
   panelViews: 0,
   statusViews: 0
 };
 const LOG = [];
-const LOG_LIMIT = 120;
+const LOG_LIMIT = 240;
 function logEvent(event, detail) {
   try {
     LOG.push({ t: Date.now(), event: String(event).slice(0, 24), detail: String(detail || "").slice(0, 120) });
     if (LOG.length > LOG_LIMIT) LOG.splice(0, LOG.length - LOG_LIMIT);
   } catch (_) {}
+}
+
+// Debug trace switch, mirrored from env.DEBUG by getRuntime(). Kept module-global
+// so low-level helpers (Stream, connect wrapper) can log without a cfg reference.
+let DEBUG_ON = ENV.DEBUG === "true" || ENV.DEBUG === "1";
+
+// Single structured diagnostic line. Always mirrored into the in-memory LOG ring
+// (so the admin /status page shows it) and additionally printed to stdout when
+// DEBUG is enabled. Secrets, tokens and full IPs are never emitted verbatim:
+// IPs are truncated to the first two octets.
+function diag(scope, message, extra) {
+  const detail = extra === undefined ? String(message) : String(message) + " " + String(extra);
+  logEvent(scope, detail);
+  if (DEBUG_ON) {
+    try { console.log(`[${new Date().toISOString()}] ${scope.padEnd(10)} ${detail}`); } catch (_) {}
+  }
+}
+
+// Verbose per-request trace. Unlike logEvent() (a 240-entry ring with 120-char
+// details), this keeps the full request line, every request header, a body
+// preview and the resulting status, so a failed Telegram handshake can be
+// reconstructed step by step. Secrets are redacted before anything is stored.
+const REQLOG = [];
+const REQLOG_LIMIT = 200;
+
+function redactHeader(name, value) {
+  const lower = String(name).toLowerCase();
+  if (lower === "authorization" || lower === "proxy-authorization" || lower === "cookie" || lower === "set-cookie") {
+    const text = String(value);
+    return text.length > 24 ? text.slice(0, 12) + "…" + text.slice(-6) + " (len=" + text.length + ")" : "***";
+  }
+  return String(value);
+}
+
+function hexPreview(bytes, limit) {
+  const take = Math.min(bytes.length, limit);
+  let hex = "";
+  for (let i = 0; i < take; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
+  return hex + (bytes.length > take ? " …+" + (bytes.length - take) + "B" : "");
+}
+
+function logRequest(entry) {
+  try {
+    entry.t = Date.now();
+    REQLOG.push(entry);
+    if (REQLOG.length > REQLOG_LIMIT) REQLOG.splice(0, REQLOG.length - REQLOG_LIMIT);
+  } catch (_) {}
+  if (DEBUG_ON) {
+    try {
+      const headers = Object.keys(entry.headers).map((k) => k + ": " + entry.headers[k]).join(" | ");
+      console.log(`[${new Date(entry.t).toISOString()}] req        ${entry.method} ${entry.path} status=${entry.status || "-"} dur=${entry.ms === undefined ? "-" : entry.ms + "ms"} body=${entry.body || "-"}\n    headers ${headers}`);
+    } catch (_) {}
+  }
+}
+
+function maskIp(ip) {
+  const text = String(ip || "");
+  if (!text) return "-";
+  if (text.includes(":")) {
+    const parts = text.split(":");
+    return parts.slice(0, 2).join(":") + ":…";
+  }
+  const parts = text.split(".");
+  return parts.length === 4 ? parts[0] + "." + parts[1] + ".x.x" : text;
 }
 
 const PERMISSIONS_POLICY = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()";
@@ -1101,8 +1178,9 @@ function parseSecret(hexValue) {
   let hex = String(hexValue).trim().toLowerCase();
   if (hex.startsWith("0x")) hex = hex.substring(2);
   if (!/^[0-9a-f]+$/.test(hex)) return null;
-  if (hex.length === 32) return hexToBytes(hex);
-  if (hex.length === 34 && hex.startsWith("dd")) return hexToBytes(hex.substring(2));
+  // Telegram uses the secret exactly as typed into the link (17 bytes when the
+  // "dd" prefix is present, 16 bytes otherwise), so the value is never trimmed.
+  if (hex.length === 32 || hex.length === 34) return hexToBytes(hex);
   return null;
 }
 
@@ -1153,7 +1231,15 @@ function resolveConfig(env) {
       if (Number.isFinite(p) && p > 0 && p <= 65535 && !ports.includes(p)) ports.push(p);
     }
   }
-  if (ports.length === 0) for (const p of HTTPS_PORTS) ports.push(p);
+  // A public TLS port (PUBLIC_PORT, default 443) is what Telegram actually dials,
+  // so it always leads the list. Without it the panel would advertise Cloudflare's
+  // 2053/2083/2087/2096 ports, which do not exist on a self-hosted box.
+  const publicPortRaw = parseInt(env?.PUBLIC_PORT, 10);
+  const publicPort = Number.isFinite(publicPortRaw) && publicPortRaw > 0 && publicPortRaw <= 65535
+    ? publicPortRaw
+    : 443;
+  if (ports.length === 0) ports.push(publicPort);
+  else if (ports[0] !== publicPort) ports.unshift(publicPort);
 
   const carrierEnv = (typeof env?.CARRIER === "string" ? env.CARRIER.trim().toLowerCase() : "");
   const carrier = carrierEnv === "websocket" || carrierEnv === "websocket-lanes" ? carrierEnv : CONFIG.carrier;
@@ -1196,6 +1282,14 @@ function resolveConfig(env) {
     dcPort: dcPortsOverride ? dcPortsOverride[0] : CONFIG.dcPort,
     dcPorts: dcPortsOverride || CONFIG.dcPorts,
     carrier,
+    tlsCertPath: (typeof env?.TLS_CERT === "string" ? env.TLS_CERT : "").trim(),
+    tlsKeyPath: (typeof env?.TLS_KEY === "string" ? env.TLS_KEY : "").trim(),
+    tlsPort: (() => {
+      const raw = parseInt(env?.TLS_PORT, 10);
+      return Number.isFinite(raw) && raw > 0 && raw <= 65535 ? raw : 8443;
+    })(),
+    publicPort,
+    trustProxy: env?.TRUST_PROXY === "true" || env?.TRUST_PROXY === "1",
     batchBytes: CONFIG.batchBytes,
     bootstrapTtl: CONFIG.bootstrapTtl,
     sessionTtl: CONFIG.sessionTtl,
@@ -1210,6 +1304,7 @@ let cachedKey = null;
 
 async function getRuntime(env) {
   const resolved = resolveConfig(env);
+  DEBUG_ON = resolved.debug === true || DEBUG_ON;
   const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.decoyUrl}:${resolved.maxStreams}:${resolved.sessionPath}:${resolved.wsPath}:${resolved.debug}:${resolved.carrier}:${resolved.acceptGenerated}:${resolved.generatorEnabled}:${resolved.adminKey}:${resolved.extraHosts.join(",")}:${resolved.ports.join(",")}`;
   if (cachedRuntime && cachedKey === cacheKey) {
     return cachedRuntime;
@@ -1293,6 +1388,11 @@ async function buildRuntime(cfg) {
     adTag,
     adTagHex: cfg.adTagHex,
     debug: cfg.debug,
+    tlsCertPath: cfg.tlsCertPath,
+    tlsKeyPath: cfg.tlsKeyPath,
+    tlsPort: cfg.tlsPort,
+    publicPort: cfg.publicPort,
+    trustProxy: cfg.trustProxy,
     decoyUrl: cfg.decoyUrl,
     sessionPath: cfg.sessionPath,
     wsPath: cfg.wsPath,
@@ -1574,7 +1674,7 @@ function pageHeaders() {
 
 const PAGE_STYLE = "body{font-family:system-ui,-apple-system,'Segoe UI',Tahoma,sans-serif;max-width:760px;margin:0 auto;padding:16px;background:#f6f7f9;color:#1d2330;line-height:1.8}h1{font-size:21px;margin:8px 0 4px}h2{font-size:16px;margin-top:28px}.card{background:#fff;border-radius:12px;padding:12px 16px;margin:10px 0;box-shadow:0 1px 3px rgba(0,0,0,.08)}a.btn{display:block;text-align:center;background:#2a9df4;color:#fff;text-decoration:none;padding:10px;border-radius:10px;margin:6px 0;font-weight:bold}code,textarea{direction:ltr;text-align:left;font-family:ui-monospace,Consolas,monospace;font-size:12px}textarea{width:100%;height:58px;box-sizing:border-box;border:1px solid #ccd;border-radius:8px;padding:6px}textarea.one{height:34px}.muted{color:#667;font-size:13px}.warn{background:#fff4e5;border-inline-start:4px solid #f0a020}footer.credit{margin:32px 0 8px;text-align:center;font-size:12px;color:#889;direction:ltr}footer.credit a{color:#667}ol{padding-inline-start:22px;margin:4px 0}nav.lang{text-align:end;font-size:14px}nav.lang label{cursor:pointer;padding:4px 10px;border-radius:8px;color:#2a6fd6}"
   + ".fa{display:none}#l-fa:checked~main{direction:rtl;font-family:Tahoma,system-ui,sans-serif}#l-fa:checked~main .en{display:none}#l-fa:checked~main span.fa{display:inline}#l-fa:checked~main div.fa,#l-fa:checked~main p.fa,#l-fa:checked~main ol.fa,#l-fa:checked~main h1.fa,#l-fa:checked~main h2.fa{display:block}#l-en:checked~main nav label[for=l-en],#l-fa:checked~main nav label[for=l-fa]{background:#e3eefc;font-weight:bold}"
-  + "pre{background:#f0f2f5;padding:8px;border-radius:8px;overflow-x:auto;font-size:11px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:4px 8px;border-bottom:1px solid #e5e7eb;text-align:start;vertical-align:top}th{font-weight:600;white-space:nowrap}.ok{color:#177245}.bad{color:#b33}a.plain{color:#2a6fd6}";
+  + "pre{background:#f0f2f5;padding:8px;border-radius:8px;overflow-x:auto;font-size:11px}pre.req-pre{margin:0;max-width:360px;max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-all;font-size:11px;background:transparent;padding:0;direction:ltr;text-align:left}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:4px 8px;border-bottom:1px solid #e5e7eb;text-align:start;vertical-align:top}th{font-weight:600;white-space:nowrap}.ok{color:#177245}.bad{color:#b33}a.plain{color:#2a6fd6}";
 
 // Inline text in both languages; CSS shows one of them (no JavaScript needed).
 function bi(en, fa) {
@@ -1740,6 +1840,9 @@ async function serveStatus(cfg, host, lang, wantsProbe) {
     [bi("Carrier", "حامل"), escapeHtml(cfg.carrier)],
     [bi("Secret mode", "حالت سکرت"), secretMode],
     [bi("Max streams per session", "حداکثر استریم در هر نشست"), String(cfg.maxStreams)],
+    [bi("Public ports", "پورت‌های عمومی"), escapeHtml((cfg.ports || []).join(", "))],
+    [bi("Native TLS", "TLS بومی"), tlsSummary()],
+    [bi("Debug logging", "لاگ اشکال‌زدایی"), cfg.debug ? bi("on", "روشن") : bi("off", "خاموش")],
     [bi("AD_TAG", "AD_TAG"), cfg.adTag ? bi("set (ignored in Direct-DC mode)", "تنظیم شده (در حالت Direct-DC بی‌اثر)") : bi("not set", "تنظیم نشده")]
   ].map((row) => `<tr><th>${row[0]}</th><td>${row[1]}</td></tr>`).join("");
   const statsRows = [
@@ -1749,6 +1852,7 @@ async function serveStatus(cfg, host, lang, wantsProbe) {
     [bi("DC connects ok / failed", "اتصال‌های DC موفق / ناموفق"), (STATS.dcAttempts - STATS.dcFails) + " / " + STATS.dcFails],
     [bi("Traffic up / down", "ترافیک بالا / پایین"), fmtBytes(STATS.bytesUp) + " / " + fmtBytes(STATS.bytesDown)],
     [bi("Rejected WS tokens", "توکن‌های WebSocket ردشده"), String(STATS.wsRejects)],
+    [bi("Failed TLS handshakes", "دست‌دهی‌های ناموفق TLS"), String(STATS.tlsErrors || 0)],
     [bi("Isolate uptime", "مدت فعالیت این ایزوله"), fmtDuration(Date.now() - ISOLATE_START)]
   ].map((row) => `<tr><th>${row[0]}</th><td>${escapeHtml(row[1])}</td></tr>`).join("");
   const probeBlock = probe
@@ -1756,14 +1860,20 @@ async function serveStatus(cfg, host, lang, wantsProbe) {
     : `<div class="card"><a class="plain" href="?probe=1">${bi("Run DC reachability probe", "اجرای تست دسترسی به دیتاسنترهای تلگرام")}</a><p class="muted">${bi("Opens and immediately closes one TCP socket per DC from this Cloudflare location.", "برای هر دیتاسنتر یک اتصال TCP از همین لوکیشن کلودفلر باز و بلافاصله بسته می‌شود.")}</p></div>`;
   const logRows = LOG.slice(-60).reverse().map((e) => `<tr><td>${new Date(e.t).toISOString().slice(11, 19)}</td><td>${escapeHtml(e.event)}</td><td>${escapeHtml(e.detail)}</td></tr>`).join("");
   const logsBlock = `<div class="card"><b>${bi("Recent events", "رویدادهای اخیر")}</b> <span class="muted">${bi("(newest first, isolate memory only)", "(جدیدترین اول، فقط حافظه همین ایزوله)")}</span><table><tr><th>UTC</th><th>event</th><th>detail</th></tr>${logRows || `<tr><td colspan="3">-</td></tr>`}</table></div>`;
+  const reqRows = REQLOG.slice(-40).reverse().map((r) => {
+    const headerText = Object.keys(r.headers || {}).map((k) => `${k}: ${r.headers[k]}`).join("\n");
+    return `<tr><td>${new Date(r.t).toISOString().slice(11, 19)}</td><td>${escapeHtml(r.kind)}</td><td>${escapeHtml(r.method + " " + r.path + (r.query ? "?" + r.query : ""))}</td><td>${escapeHtml(String(r.status === undefined ? "-" : r.status))}</td><td>${escapeHtml(r.ms === undefined ? "-" : r.ms + "ms")}</td><td><pre class="req-pre" title="${escapeHtml(r.remote || "")}">${escapeHtml(headerText || "-")}</pre></td><td>${escapeHtml(r.body || "-")}</td><td>${escapeHtml(r.note || "-")}</td></tr>`;
+  }).join("");
+  const reqBlock = `<div class="card"><b>${bi("Request log", "لاگ درخواست‌ها")}</b> <span class="muted">${bi("(last 40, full headers, secret redacted)", "(۴۰ مورد آخر، هدرها کامل، سکرت مخفی)")}</span><table><tr><th>UTC</th><th>type</th><th>${bi("Path", "مسیر")}</th><th>status</th><th>ms</th><th>${bi("Headers", "هدرها")}</th><th>${bi("Body", "بدنه")}</th><th>note</th></tr>${reqRows || `<tr><td colspan="8">-</td></tr>`}</table></div>`;
   const body = `<h1>${bi("Proxy status", "وضعیت پروکسی")}</h1>
 <div class="card muted">${bi(
-    "Counters and logs are kept in this Cloudflare isolate only, reset when it is recycled, and are not shared between regions. No client IP addresses, tokens or secrets are recorded.",
-    "شمارنده‌ها و لاگ‌ها فقط در حافظه همین ایزوله کلودفلر نگهداری می‌شوند، با بازیافت ایزوله صفر می‌شوند و بین منطقه‌ها مشترک نیستند. هیچ IP، توکن یا سکرتی ثبت نمی‌شود."
+    "Counters and logs are kept in this process memory only, reset when the server restarts, and are not shared between instances. Authorization, cookie and secret values are redacted from the request log.",
+    "شمارنده‌ها و لاگ‌ها فقط در حافظه همین پروسه نگهداری می‌شوند، با ری‌استارت سرور صفر می‌شوند و بین نمونه‌ها مشترک نیستند. مقادیر Authorization، کوکی و سکرت در لاگ درخواست‌ها مخفی می‌شوند."
   )}</div>
 <div class="card"><b>${bi("Configuration", "پیکربندی")}</b><table>${infoRows}</table></div>
 <div class="card"><b>${bi("Live statistics", "آمار زنده")}</b><table>${statsRows}</table></div>
 ${probeBlock}
+${reqBlock}
 ${logsBlock}`;
   return new Response(bilingualPage("Status", lang, body, await unseal()), { status: 200, headers: pageHeaders() });
 }
@@ -1829,6 +1939,27 @@ function notFound() {
       "Cache-Control": "no-store"
     }
   });
+}
+
+// Human-readable one-liner about the TLS listener for the admin status page.
+function tlsSummary() {
+  const material = readTlsMaterial(true);
+  if (!material.cert || !material.key) {
+    return material.problems.length
+      ? "OFF — " + escapeHtml(material.problems.join("; "))
+      : "OFF — no certificate configured";
+  }
+  let parsed;
+  try { parsed = new X509Certificate(material.cert); }
+  catch (error) { return "OFF — " + escapeHtml(error.message); }
+  const daysLeft = Math.floor((new Date(parsed.validTo).getTime() - Date.now()) / 86400000);
+  const status = daysLeft < 0 ? "EXPIRED" : (daysLeft < 7 ? "EXPIRING" : "OK");
+  return `ON — port ${tlsPortLabel()} — ${status} (${daysLeft}d left) — expires ${escapeHtml(parsed.validTo)}`;
+}
+
+function tlsPortLabel() {
+  const raw = parseInt(envValue("TLS_PORT"), 10);
+  return Number.isFinite(raw) && raw > 0 && raw <= 65535 ? raw : 8443;
 }
 
 async function serveBridge(cfg, host, mode, port) {
@@ -1997,7 +2128,8 @@ class Stream {
         this.session.queued -= payload.length;
         await this.writeToDc(payload);
       }
-    } catch (_) {
+    } catch (error) {
+      diag("stream_in_error", `stream=${this.id} ${error?.message || error}`);
       this.kill(true);
     } finally {
       this.inRunning = false;
@@ -2013,12 +2145,18 @@ class Stream {
     this.clientReadIv = readIv;
     const tail = await ctrAt(this.clientReadKey, readIv, 56, header.subarray(56, 64));
     const tag = tail.subarray(0, 4);
-    if (!tagKind(tag)) throw new Error("bad tag");
+    if (!tagKind(tag)) {
+      diag("stream_bad", `stream=${this.id} bad obfuscated2 tag=${bytesToHex(tag)} secret=${bytesToHex(this.session.secret).slice(0, 4)}…`);
+      throw new Error("bad tag");
+    }
     const dcId = new DataView(tail.buffer, tail.byteOffset + 4, 2).getInt16(0, true);
     const dcKey = Math.abs(dcId);
     const address = this.session.cfg.dc[dcKey];
-    if (!address) throw new Error("bad dc");
-
+    if (!address) {
+      diag("stream_bad", `stream=${this.id} dc=${dcKey} (no route configured) tag=${bytesToHex(tag)}`);
+      throw new Error("bad dc");
+    }
+    diag("stream_init", `stream=${this.id} dc=${dcId} tag=${bytesToHex(tag)}`);
     const candidateIps = Array.isArray(address) ? address : [address];
     const candidatePorts = Array.isArray(this.session.cfg.dcPorts) ? this.session.cfg.dcPorts : [this.session.cfg.dcPort || 443];
 
@@ -2079,6 +2217,7 @@ class Stream {
       } catch (connErr) {
         lastError = connErr;
         STATS.dcFails++;
+        diag("dc_fail", `stream=${this.id} dc=${dcKey} ${hostIp}:${port} ${connErr?.message || connErr}`);
         // Previously a timed-out socket stayed pending and kept a connection slot busy.
         if (candidateSocket) { try { candidateSocket.close().catch(() => {}); } catch (_) {} }
       } finally {
@@ -2090,6 +2229,7 @@ class Stream {
       logEvent("dc_fail", `dc=${dcKey}`);
       throw lastError || new Error("failed to connect to DC");
     }
+    diag("dc_ok", `stream=${this.id} dc=${dcKey} attempts=${maxAttempts}`);
 
     this.socket = socket;
     if (this.dead) {
@@ -2125,6 +2265,11 @@ class Stream {
     const plain = await ctrAt(this.clientReadKey, this.clientReadIv, this.clientReadPos, payload);
     this.clientReadPos += payload.length;
     if (this.dead) return;
+    if (DEBUG_ON) {
+      try {
+        diag("mt_up", `stream=${this.id} len=${payload.length} plain=${hexPreview(plain, 24)}`);
+      } catch (_) {}
+    }
     const encrypted = await ctrAt(this.dcWriteKey, this.dcWriteIv, this.dcWritePos, plain);
     this.dcWritePos += payload.length;
     await this.writer.write(encrypted);
@@ -2153,6 +2298,9 @@ class Stream {
           // Fast mode: bytes from the DC are already encrypted for the client.
           const chunk = value.subarray(offset, offset + size);
           this.sendCredit -= size;
+          if (DEBUG_ON) {
+            try { diag("mt_down", `stream=${this.id} len=${size} first=${hexPreview(chunk, 16)}`); } catch (_) {}
+          }
           this.session.sendFrame(frame(0x02, this.id, chunk));
           offset += size;
         }
@@ -2187,6 +2335,7 @@ class Stream {
   kill(notify) {
     if (this.dead) return;
     this.dead = true;
+    diag("stream_close", `stream=${this.id} phase=${this.phase} up=${this.clientReadPos}B down=${this.session.bytesDown}B`);
     this.session.streams.delete(this.id);
     this.session.remember(this.id);
     this.session.queued -= this.queuedLocal;
@@ -2293,15 +2442,28 @@ class WsSession {
   }
 
   async handle(data) {
-    if (this.closed) return;
-    if (!(data instanceof ArrayBuffer)) {
+    if (this.closed) {
+      diag("ws_frame", "frame after close");
+      return;
+    }
+    // ws emits Buffer by default; Cloudflare always delivered ArrayBuffer. Accept
+    // both, otherwise every Telegram frame would look invalid and kill the lane.
+    let bytes;
+    if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+    else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    else {
+      diag("ws_frame", `unsupported payload type=${Object.prototype.toString.call(data)}`);
       this.shutdown();
       return;
     }
-    const bytes = new Uint8Array(data);
     if (bytes.length === 0 || bytes.length > REQUEST_LIMIT) {
+      diag("ws_frame", `bad frame length=${bytes.length}`);
       this.shutdown();
       return;
+    }
+    data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    if (DEBUG_ON) {
+      try { diag("ws_frame", `len=${bytes.length} first=${hexPreview(bytes, 16)}`); } catch (_) {}
     }
     this.bytesUp += bytes.length;
     STATS.bytesUp += bytes.length;
@@ -2421,7 +2583,10 @@ class WsSession {
 
 async function serveSession(request, cfg) {
   const auth = request.headers.get("authorization") || "";
-  if (!auth.startsWith("Bearer ") || auth.length <= 7) return notFound();
+  if (!auth.startsWith("Bearer ") || auth.length <= 7) {
+    logEvent("session_reject", "missing bearer");
+    return notFound();
+  }
   const token = auth.substring(7);
   if (request.method === "DELETE") {
     if (!(await verifyToken(cfg, token, TOKEN_KIND_SESSION))) return notFound();
@@ -2436,12 +2601,19 @@ async function serveSession(request, cfg) {
   const declaredLength = parseInt(request.headers.get("content-length") || "", 10);
   if (Number.isFinite(declaredLength) && declaredLength > 4096) return notFound();
   const verified = await verifyToken(cfg, token, TOKEN_KIND_BOOTSTRAP);
-  if (!verified) return notFound();
-  if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) return notFound();
+  if (!verified) {
+    logEvent("session_reject", "invalid or expired bootstrap token");
+    return notFound();
+  }
+  if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) {
+    logEvent("session_reject", "generated mode disabled");
+    return notFound();
+  }
   const body = new Uint8Array(await request.arrayBuffer());
-  if (body.length !== 9) return notFound();
-  if (body[0] !== 0x10 || body[1] !== 0 || body[2] !== 0 || body[3] !== 0) return notFound();
-  if (body[4] !== 0 || body[5] !== 0 || body[6] !== 0 || body[7] !== 1 || body[8] !== 1) return notFound();
+  if (body.length !== 9 || body[0] !== 0x10 || body[1] !== 0 || body[2] !== 0 || body[3] !== 0 || body[4] !== 0 || body[5] !== 0 || body[6] !== 0 || body[7] !== 1 || body[8] !== 1) {
+    logEvent("session_reject", `bad handshake body len=${body.length}`);
+    return notFound();
+  }
   const sessionToken = await issueToken(cfg, TOKEN_KIND_SESSION, cfg.sessionTtl, verified.mode);
   return new Response(WELCOME, {
     status: 200,
@@ -2456,11 +2628,23 @@ async function serveSession(request, cfg) {
 }
 
 async function serveWebSocket(request, cfg, host, port) {
-  if (request.method !== "GET") return notFound();
-  if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") return notFound();
-  if (request.headers.get("authorization")) return notFound();
+  if (request.method !== "GET") {
+    diag("ws_reject", `method=${request.method}`);
+    return notFound();
+  }
+  if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") {
+    diag("ws_reject", "missing Upgrade: websocket header");
+    return notFound();
+  }
+  if (request.headers.get("authorization")) {
+    diag("ws_reject", "unexpected Authorization header");
+    return notFound();
+  }
   const offered = (request.headers.get("sec-websocket-protocol") || "").split(",").map((value) => value.trim()).filter(Boolean);
-  if (offered.length !== 1) return notFound();
+  if (offered.length !== 1) {
+    diag("ws_reject", `subprotocol count=${offered.length}`);
+    return notFound();
+  }
   const protocol = offered[0];
   let token = "";
   let laneId = 0;
@@ -2469,11 +2653,18 @@ async function serveWebSocket(request, cfg, host, port) {
   } else if (protocol.startsWith("tproxy-lane-v1.")) {
     const rest = protocol.substring(15);
     const dot = rest.lastIndexOf(".");
-    if (dot <= 0 || !/^[1-9][0-9]{0,7}$/.test(rest.substring(dot + 1))) return notFound();
+    if (dot <= 0 || !/^[1-9][0-9]{0,7}$/.test(rest.substring(dot + 1))) {
+      diag("ws_reject", "malformed lane subprotocol");
+      return notFound();
+    }
     token = rest.substring(0, dot);
     laneId = parseInt(rest.substring(dot + 1), 10);
-    if (laneId > 0xffffff) return notFound();
+    if (laneId > 0xffffff) {
+      diag("ws_reject", `lane id out of range=${laneId}`);
+      return notFound();
+    }
   } else {
+    diag("ws_reject", `unknown subprotocol=${protocol.slice(0, 18)}…`);
     return notFound();
   }
   const verified = await verifyToken(cfg, token, TOKEN_KIND_SESSION);
@@ -2481,10 +2672,13 @@ async function serveWebSocket(request, cfg, host, port) {
     // A real WebSocket upgrade with an invalid/expired token is either a
     // forgery attempt or a client whose token expired - worth a log line.
     STATS.wsRejects++;
-    logEvent("ws_reject", "invalid or expired session token");
+    diag("ws_reject", `invalid or expired session token (lane=${laneId})`);
     return notFound();
   }
-  if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) return notFound();
+  if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) {
+    diag("ws_reject", `generated secret mode=${verified.mode} not accepted`);
+    return notFound();
+  }
   let secret = cfg.base;
   if (verified.mode >= PORT_MODE_BASE && verified.mode < PORT_MODE_BASE + cfg.ports.length) {
     const portNum = cfg.ports[verified.mode - PORT_MODE_BASE];
@@ -2493,7 +2687,11 @@ async function serveWebSocket(request, cfg, host, port) {
     const label = verified.mode === 2 && port && port !== "443" && port !== "80" ? `${host}:${port}` : host;
     secret = await deriveSecret(cfg, label);
   }
-  if (!secret) return notFound();
+  if (!secret) {
+    diag("ws_reject", `no secret for mode=${verified.mode}`);
+    return notFound();
+  }
+  diag("ws_accept", `lane=${laneId} mode=${verified.mode} carrier=${cfg.carrier} host=${host} port=${port || "-"}`);
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
@@ -2646,16 +2844,21 @@ function readBody(req) {
       }
       chunks.push(chunk);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("end", () => {
+      const buf = Buffer.concat(chunks);
+      req._proxygoshaBody = buf;
+      resolve(buf);
+    });
     req.on("error", reject);
   });
 }
 
 // Wrap the Node IncomingMessage in the small subset of the Web Request API used
 // by the handlers (method / url / headers / arrayBuffer / text).
-function makeRequest(req) {
+function makeRequest(req, secure) {
   const rawHost = String(req.headers.host || "localhost");
-  const url = new URL(req.url || "/", "http://" + rawHost);
+  const scheme = secure || req.socket?.encrypted ? "https" : "http";
+  const url = new URL(req.url || "/", scheme + "://" + rawHost);
   const headers = new Headers();
   for (const key of Object.keys(req.headers)) {
     const value = req.headers[key];
@@ -2707,39 +2910,79 @@ async function writeResponse(res, response) {
   res.end();
 }
 
-async function handleHttpRequest(req, res) {
+async function handleHttpRequest(req, res, secure) {
+  const startedAt = Date.now();
+  const requestHeaders = {};
+  for (const key of Object.keys(req.headers)) {
+    const value = req.headers[key];
+    requestHeaders[key] = redactHeader(key, Array.isArray(value) ? value.join(", ") : value);
+  }
+  const requestPath = (req.url || "/").split("?")[0];
+  const query = (req.url || "").includes("?") ? (req.url || "").split("?")[1] : "";
   let request;
   try {
-    request = makeRequest(req);
+    request = makeRequest(req, secure);
   } catch (error) {
     reportError("http parse " + (req.url || ""), error);
+    logRequest({ kind: "http", method: req.method || "GET", path: requestPath, query, headers: requestHeaders, status: 400, ms: Date.now() - startedAt, note: "parse error: " + (error && error.message) });
     try { res.statusCode = 400; res.end(); } catch (_) {}
     return;
+  }
+  if (DEBUG_ON) {
+    diag("http_in", `${secure ? "https" : "http"} ${req.method} ${requestPath} host=${String(req.headers.host || "-").slice(0, 60)}`);
   }
   try {
     const response = await handleRequest(request, APP_ENV, {});
     await writeResponse(res, response);
+    const bodyBytes = req._proxygoshaBody;
+    logRequest({
+      kind: "http",
+      method: req.method || "GET",
+      path: requestPath,
+      query: query.slice(0, 160),
+      headers: requestHeaders,
+      status: response.status || 200,
+      ms: Date.now() - startedAt,
+      body: bodyBytes ? `${bodyBytes.length}B ${hexPreview(bodyBytes, 32)}` : "-",
+      note: [response.headers.get("x-carrier-mode") ? "carrier=" + response.headers.get("x-carrier-mode") : "", response.headers.get("sec-websocket-protocol") ? "subprotocol=" + response.headers.get("sec-websocket-protocol") : ""].filter(Boolean).join(" "),
+      remote: maskIp(req.socket?.remoteAddress)
+    });
   } catch (error) {
     reportError("http " + req.method + " " + (req.url || ""), error);
     try {
-      await writeResponse(res, await safeFallback(APP_ENV, request));
+      const fallback = await safeFallback(APP_ENV, request);
+      await writeResponse(res, fallback);
+      logRequest({ kind: "http", method: req.method || "GET", path: requestPath, query, headers: requestHeaders, status: fallback.status || 200, ms: Date.now() - startedAt, note: "handler error: " + (error && error.message ? error.message : error), remote: maskIp(req.socket?.remoteAddress) });
     } catch (e2) {
       reportError("http fallback", e2);
       try { res.statusCode = 500; res.end(); } catch (_) {}
+      logRequest({ kind: "http", method: req.method || "GET", path: requestPath, query, headers: requestHeaders, status: 500, ms: Date.now() - startedAt, note: "fallback failed: " + (e2 && e2.message ? e2.message : e2), remote: maskIp(req.socket?.remoteAddress) });
     }
   }
 }
 
-async function handleUpgrade(req, socket, head) {
+async function handleUpgrade(req, socket, head, secure) {
+  const startedAt = Date.now();
+  const requestHeaders = {};
+  for (const key of Object.keys(req.headers)) {
+    const value = req.headers[key];
+    requestHeaders[key] = redactHeader(key, Array.isArray(value) ? value.join(", ") : value);
+  }
+  const upgradePath = (req.url || "/").split("?")[0];
+  const upgradeQuery = (req.url || "").includes("?") ? (req.url || "").split("?")[1].slice(0, 160) : "";
+  const remote = maskIp(socket?.remoteAddress);
   try {
-    const request = makeRequest(req);
+    const request = makeRequest(req, secure);
     const url = new URL(request.url);
     const host = requestHost(request, url);
     const rawHost = String(request.headers.get("host") || url.host || "");
     const portMatch = /:([0-9]+)$/.exec(rawHost);
     const port = portMatch ? portMatch[1] : (url.port || "");
+    diag("ws_upgrade", `${secure ? "wss" : "ws"} ${url.pathname} host=${host} port=${port || "-"} subprotocol=${(req.headers["sec-websocket-protocol"] || "-").slice(0, 20)}…`);
     const cfg = await getRuntime(APP_ENV);
     if (!cfg) {
+      diag("ws_reject", "runtime not configured");
+      logRequest({ kind: "ws", method: "GET", path: upgradePath, query: upgradeQuery, headers: requestHeaders, status: 404, ms: Date.now() - startedAt, note: "runtime not configured", remote });
       socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
       return;
     }
@@ -2747,30 +2990,170 @@ async function handleUpgrade(req, socket, head) {
     const client = response && response.webSocket;
     const marker = client && client._serverWebSocket;
     if (!marker) {
+      logRequest({ kind: "ws", method: "GET", path: upgradePath, query: upgradeQuery, headers: requestHeaders, status: 404, ms: Date.now() - startedAt, note: "handshake rejected (token/subprotocol/host)", remote });
       socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       marker._attach(ws);
     });
+    logRequest({ kind: "ws", method: "GET", path: upgradePath, query: upgradeQuery, headers: requestHeaders, status: 101, ms: Date.now() - startedAt, note: "subprotocol=" + (req.headers["sec-websocket-protocol"] || "-").slice(0, 24), remote });
   } catch (error) {
     reportError("ws upgrade " + (req.url || ""), error);
+    diag("ws_error", `${req.url || "/"} ${error?.message || error}`);
+    logRequest({ kind: "ws", method: "GET", path: upgradePath, query: upgradeQuery, headers: requestHeaders, status: 0, ms: Date.now() - startedAt, note: "upgrade error: " + (error?.message || error), remote });
     try { socket.destroy(); } catch (_) {}
   }
 }
 
+// ============================================================================
+// Native TLS support
+// ============================================================================
+// Telegram's Web Proxy clients only speak HTTPS/WSS. A plaintext listener is
+// therefore useless on its own: the link Telegram opens (https://host:443/...)
+// must terminate TLS on the very same port. Certificates come from either
+// PROXYGOSHA_TLS_CERT / PROXYGOSHA_TLS_KEY (PEM file paths) or, for convenience,
+// PROXYGOSHA_TLS_CERT_PEM / PROXYGOSHA_TLS_KEY_PEM (inline PEM text, useful when
+// the platform only exposes env vars). A self-signed cert is generated on the
+// fly if nothing is configured and TLS_AUTO=1, which makes local testing trivial.
+
+function readTlsMaterial(quiet) {
+  const certPath = envValue("TLS_CERT");
+  const keyPath = envValue("TLS_KEY");
+  const certPem = envValue("TLS_CERT_PEM");
+  const keyPem = envValue("TLS_KEY_PEM");
+
+  let cert = certPem || null;
+  let key = keyPem || null;
+  const problems = [];
+  const trace = quiet ? () => {} : diag;
+
+  if (!cert && certPath) {
+    try {
+      cert = fs.readFileSync(certPath, "utf8");
+      trace("tls", `loaded certificate from ${certPath}`);
+    } catch (error) {
+      problems.push(`cannot read TLS_CERT "${certPath}": ${error.message}`);
+    }
+  }
+  if (!key && keyPath) {
+    try {
+      key = fs.readFileSync(keyPath, "utf8");
+      trace("tls", `loaded private key from ${keyPath}`);
+    } catch (error) {
+      problems.push(`cannot read TLS_KEY "${keyPath}": ${error.message}`);
+    }
+  }
+  if (cert && !key) problems.push("certificate present but no private key");
+  if (key && !cert) problems.push("private key present but no certificate");
+  if (!cert || !key) return { cert: null, key: null, problems };
+
+  try {
+    const parsed = new X509Certificate(cert);
+    const validTo = new Date(parsed.validTo);
+    const daysLeft = Math.floor((validTo.getTime() - Date.now()) / 86400000);
+    trace("tls", `certificate subject="${parsed.subject.replace(/\n/g, ", ")}" expires=${parsed.validTo} (${daysLeft}d)`);
+    if (daysLeft < 0) problems.push(`certificate expired ${-daysLeft} days ago`);
+    else if (daysLeft < 7) problems.push(`certificate expires in ${daysLeft} day(s)`);
+    const sans = (parsed.subjectAltName || "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (sans.length) trace("tls", `certificate SANs: ${sans.join(" | ").slice(0, 150)}`);
+  } catch (error) {
+    problems.push(`certificate is not parseable PEM: ${error.message}`);
+  }
+
+  return { cert, key, problems };
+}
+
+// TLS handshake diagnostics. Every failed handshake is logged with the peer's
+// masked IP and the concrete OpenSSL reason, which is exactly what you need
+// when Telegram silently fails to connect (wrong port, expired cert, SNI
+// mismatch, or a client that refuses an untrusted chain).
+function attachTlsDiagnostics(tlsServer, label) {
+  tlsServer.on("tlsClientError", (error, socket) => {
+    STATS.tlsErrors = (STATS.tlsErrors || 0) + 1;
+    diag("tls_error", `${label} ${maskIp(socket?.remoteAddress)} ${error?.code || ""} ${error?.message || error}`);
+  });
+  tlsServer.on("secureConnection", (socket) => {
+    if (!DEBUG_ON) return;
+    try {
+      const peer = socket.getPeerCertificate?.() || {};
+      const cipher = socket.getCipher?.() || {};
+      diag("tls_ok", `${label} ${maskIp(socket.remoteAddress)} proto=${socket.getProtocol?.()} cipher=${cipher.name || "-"} sni=${socket.servername || "-"} cn=${String(peer.subject?.CN || "-")}`);
+    } catch (_) {}
+  });
+  tlsServer.on("clientError", (error, socket) => {
+    diag("tls_client_error", `${label} ${error?.code || ""} ${error?.message || error}`);
+    try { socket.destroy(); } catch (_) {}
+  });
+}
+
+function buildTlsContext() {
+  const material = readTlsMaterial();
+  for (const problem of material.problems) diag("tls_config", problem);
+  if (!material.cert || !material.key) return null;
+  diag("tls", "TLS context created (min version TLSv1.2)");
+  return { cert: material.cert, key: material.key };
+}
+
 const server = http.createServer((req, res) => {
-  handleHttpRequest(req, res);
+  handleHttpRequest(req, res, false);
 });
 
 server.on("upgrade", (req, socket, head) => {
-  handleUpgrade(req, socket, head);
+  handleUpgrade(req, socket, head, false);
 });
 
 server.on("error", (error) => {
   reportError("http server", error);
+  diag("listen_error", `${LISTEN_HOST}:${LISTEN_PORT} ${error?.code || ""} ${error?.message || error}`);
 });
+
+// Optional HTTPS listener. Enabled only when a certificate is available; the
+// plaintext listener stays up so an existing reverse proxy keeps working.
+const TLS_PORT = tlsPortLabel();
+const TLS_ENABLED = (envValue("TLS_ENABLED") || "auto").toLowerCase();
+
+let tlsServer = null;
+
+function startTls() {
+  const context = buildTlsContext();
+  if (!context) {
+    if (TLS_ENABLED === "on" || TLS_ENABLED === "1" || TLS_ENABLED === "true") {
+      diag("tls_config", "TLS explicitly enabled but no usable certificate; HTTPS listener not started");
+    } else {
+      diag("tls", "no certificate configured; HTTPS listener disabled (plaintext only)");
+    }
+    return;
+  }
+  tlsServer = https.createServer({ ...context, minVersion: "TLSv1.2" }, (req, res) => {
+    handleHttpRequest(req, res, true);
+  });
+  attachTlsDiagnostics(tlsServer, `:${TLS_PORT}`);
+  tlsServer.on("upgrade", (req, socket, head) => {
+    handleUpgrade(req, socket, head, true);
+  });
+  tlsServer.on("error", (error) => {
+    reportError("https server", error);
+    diag("listen_error", `${LISTEN_HOST}:${TLS_PORT} (TLS) ${error?.code || ""} ${error?.message || error}`);
+  });
+  tlsServer.listen(TLS_PORT, LISTEN_HOST, () => {
+    console.log("[proxygosha] listening on https://" + LISTEN_HOST + ":" + TLS_PORT);
+    diag("tls", `HTTPS listener ready on ${LISTEN_HOST}:${TLS_PORT}`);
+  });
+}
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.log("[proxygosha] listening on http://" + LISTEN_HOST + ":" + LISTEN_PORT);
+  diag("boot", `HTTP listener ready on ${LISTEN_HOST}:${LISTEN_PORT}`);
+  startTls();
+  diag("boot", `debug=${DEBUG_ON ? "on" : "off"} port=${LISTEN_PORT} tls_port=${TLS_PORT}`);
 });
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    diag("boot", `received ${signal}, shutting down`);
+    try { server.close(); } catch (_) {}
+    try { if (tlsServer) tlsServer.close(); } catch (_) {}
+    setTimeout(() => process.exit(0), 1000);
+  });
+}
