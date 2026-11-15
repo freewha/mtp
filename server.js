@@ -26,7 +26,7 @@ const ENV = process.env;
 const CONFIG_KEYS = [
   "SECRET", "AD_TAG", "DEBUG", "DECOY_URL", "MAX_STREAMS", "SESSION_PATH", "WS_PATH",
   "ADMIN_KEY", "EXTRA_HOSTS", "CARRIER", "GENERATOR_ENABLED", "GENERATOR_KEY", "ACCEPT_GENERATED",
-  "DC_OVERRIDE"
+  "DC_OVERRIDE", "PROXY_PORTS"
 ];
 
 // On Cloudflare the bindings are plain env vars. On a Node host the process
@@ -1142,6 +1142,19 @@ function resolveConfig(env) {
     .split(/[,\s]+/)
     .map((value) => value.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/[:/].*$/, "").replace(/\.$/, ""))
     .filter((value) => /^[a-z0-9.-]+$/.test(value) && !value.includes(".."));
+  // PROXY_PORTS overrides the Telegram-facing ports (default: Cloudflare's
+  // 6 allowed HTTPS ports). For a self-hosted Node setup you can point it at
+  // your own public port, e.g. "9090" or "443,8443". The first entry carries
+  // the base SECRET; every other entry gets its own derived secret.
+  const ports = [];
+  if (typeof env?.PROXY_PORTS === "string" && env.PROXY_PORTS.trim()) {
+    for (const token of env.PROXY_PORTS.split(/[,\s]+/)) {
+      const p = parseInt(token, 10);
+      if (Number.isFinite(p) && p > 0 && p <= 65535 && !ports.includes(p)) ports.push(p);
+    }
+  }
+  if (ports.length === 0) for (const p of HTTPS_PORTS) ports.push(p);
+
   const carrierEnv = (typeof env?.CARRIER === "string" ? env.CARRIER.trim().toLowerCase() : "");
   const carrier = carrierEnv === "websocket" || carrierEnv === "websocket-lanes" ? carrierEnv : CONFIG.carrier;
 
@@ -1171,6 +1184,7 @@ function resolveConfig(env) {
     adTagHex,
     debug,
     hostnames,
+    ports,
     decoyUrl,
     maxStreams,
     sessionPath,
@@ -1196,7 +1210,7 @@ let cachedKey = null;
 
 async function getRuntime(env) {
   const resolved = resolveConfig(env);
-  const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.decoyUrl}:${resolved.maxStreams}:${resolved.sessionPath}:${resolved.wsPath}:${resolved.debug}:${resolved.carrier}:${resolved.acceptGenerated}:${resolved.generatorEnabled}:${resolved.adminKey}:${resolved.extraHosts.join(",")}`;
+  const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.decoyUrl}:${resolved.maxStreams}:${resolved.sessionPath}:${resolved.wsPath}:${resolved.debug}:${resolved.carrier}:${resolved.acceptGenerated}:${resolved.generatorEnabled}:${resolved.adminKey}:${resolved.extraHosts.join(",")}:${resolved.ports.join(",")}`;
   if (cachedRuntime && cachedKey === cacheKey) {
     return cachedRuntime;
   }
@@ -1233,9 +1247,9 @@ async function buildRuntime(cfg) {
 
   const portSecrets = {};
   if (base) {
-    for (const p of HTTPS_PORTS) {
+    for (const p of cfg.ports) {
       let sBytes;
-      if (p === 443) {
+      if (p === cfg.ports[0]) {
         sBytes = base;
       } else {
         sBytes = (await sha256(concat(te.encode("proxygosha-port-secret-v1\n"), base, te.encode("\n" + p)))).slice(0, 16);
@@ -1272,6 +1286,7 @@ async function buildRuntime(cfg) {
     generatorHmac: generatorRaw ? await importHmac(generatorRaw, ["sign", "verify"]) : null,
     tokenKey,
     hosts,
+    ports: cfg.ports,
     dc: cfg.dc,
     dcPort: cfg.dcPort,
     dcPorts: cfg.dcPorts,
@@ -1322,7 +1337,7 @@ async function bridgeMode(cfg, host, capability, port) {
   if (!provided || provided.length !== 32) return -1;
 
   const incomingPort = port ? parseInt(port, 10) : 443;
-  const isKnownPort = HTTPS_PORTS.includes(incomingPort);
+  const isKnownPort = cfg.ports.includes(incomingPort);
 
   if (isKnownPort && cfg.portSecrets?.[incomingPort]) {
     const pKeys = cfg.portSecrets[incomingPort].keys;
@@ -1335,7 +1350,7 @@ async function bridgeMode(cfg, host, capability, port) {
     for (const ctx of contexts) {
       for (const key of pKeys) {
         if (await crypto.subtle.verify("HMAC", key, provided, ctx)) {
-          return PORT_MODE_BASE + HTTPS_PORTS.indexOf(incomingPort);
+          return PORT_MODE_BASE + cfg.ports.indexOf(incomingPort);
         }
       }
     }
@@ -1344,7 +1359,7 @@ async function bridgeMode(cfg, host, capability, port) {
   const candidateHosts = [host];
   const candidatePorts = [];
   if (port && port !== "443" && port !== "80") candidatePorts.push(port);
-  for (const p of HTTPS_PORTS) if (p !== 443 && !candidatePorts.includes(String(p))) candidatePorts.push(String(p));
+  for (const p of cfg.ports) if (p !== cfg.ports[0] && !candidatePorts.includes(String(p))) candidatePorts.push(String(p));
   for (const p of candidatePorts) candidateHosts.push(`${host}:${p}`);
 
   for (const h of candidateHosts) {
@@ -1357,8 +1372,8 @@ async function bridgeMode(cfg, host, capability, port) {
   }
 
   if (cfg.portSecrets) {
-    for (let idx = 0; idx < HTTPS_PORTS.length; idx++) {
-      const p = HTTPS_PORTS[idx];
+    for (let idx = 0; idx < cfg.ports.length; idx++) {
+      const p = cfg.ports[idx];
       if (p === incomingPort) continue;
       const pKeys = cfg.portSecrets[p].keys;
       const contexts = [
@@ -1368,7 +1383,7 @@ async function bridgeMode(cfg, host, capability, port) {
       for (const ctx of contexts) {
         for (const key of pKeys) {
           if (await crypto.subtle.verify("HMAC", key, provided, ctx)) {
-            if (!port || port === "443" || port === String(p)) {
+            if (!port || port === String(cfg.ports[0]) || port === String(p)) {
               return PORT_MODE_BASE + idx;
             }
           }
@@ -1549,10 +1564,10 @@ async function servePanel(cfg, host, port, lang) {
   for (const h of [host, ...(cfg.extraHosts || [])]) if (h && !hosts.includes(h)) hosts.push(h);
   const sections = hosts.map((h) => {
     const workersDev = h.endsWith(".workers.dev");
-    const items = HTTPS_PORTS.map((p) => {
+    const items = cfg.ports.map((p) => {
       const pSecret = cfg.portSecrets?.[p]?.secretHex || secret;
       const link = "tg://webproxy?server=" + encodeURIComponent(h) + (p !== 443 ? "&port=" + p : "") + "&secret=" + pSecret;
-      return `<div class="card"><b>${bi("Port", "پورت")} ${p}</b>${p === 443 ? " " + bi("(default)", "(پیش‌فرض)") : ""}<a class="btn" href="${escapeHtml(link)}">${bi("Connect in Telegram", "اتصال در تلگرام")}</a><textarea readonly>${escapeHtml(link)}</textarea></div>`;
+      return `<div class="card"><b>${bi("Port", "پورت")} ${p}</b>${p === cfg.ports[0] ? " " + bi("(default)", "(پیش‌فرض)") : ""}<a class="btn" href="${escapeHtml(link)}">${bi("Connect in Telegram", "اتصال در تلگرام")}</a><textarea readonly>${escapeHtml(link)}</textarea></div>`;
     }).join("");
     const note = workersDev
       ? `<p class="muted">${bi(
@@ -1560,9 +1575,9 @@ async function servePanel(cfg, host, port, lang) {
           "آدرس workers.dev معمولاً در ایران فیلتر است و ممکن است بعضی پورت‌ها رویش باز نباشند. بهتر است یک دامنه شخصی (Custom Domain) به ورکر وصل کنید."
         )}</p>`
       : "";
-    const manualItems = HTTPS_PORTS.map((p) => {
+    const manualItems = cfg.ports.map((p) => {
       const s = cfg.portSecrets?.[p]?.secretHex || secret;
-      return `<div style="margin:6px 0"><b>${bi("Port", "پورت")} ${p}</b>${p === 443 ? " " + bi("(default)", "(پیش‌فرض)") : ""}:<textarea class="one" readonly>${escapeHtml(s)}</textarea></div>`;
+      return `<div style="margin:6px 0"><b>${bi("Port", "پورت")} ${p}</b>${p === cfg.ports[0] ? " " + bi("(default)", "(پیش‌فرض)") : ""}:<textarea class="one" readonly>${escapeHtml(s)}</textarea></div>`;
     }).join("");
     const manual = `<div class="card"><b>${bi("Manual entry", "ورود دستی")}</b> — ${bi(
         "in Telegram's proxy settings, add a new proxy of type <b>WEB</b>. Each port has its own unique secret:",
@@ -2427,8 +2442,8 @@ async function serveWebSocket(request, cfg, host, port) {
   }
   if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) return notFound();
   let secret = cfg.base;
-  if (verified.mode >= PORT_MODE_BASE && verified.mode < PORT_MODE_BASE + HTTPS_PORTS.length) {
-    const portNum = HTTPS_PORTS[verified.mode - PORT_MODE_BASE];
+  if (verified.mode >= PORT_MODE_BASE && verified.mode < PORT_MODE_BASE + cfg.ports.length) {
+    const portNum = cfg.ports[verified.mode - PORT_MODE_BASE];
     secret = cfg.portSecrets?.[portNum]?.secret || cfg.base;
   } else if (verified.mode === 1 || verified.mode === 2) {
     const label = verified.mode === 2 && port && port !== "443" && port !== "80" ? `${host}:${port}` : host;
