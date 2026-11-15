@@ -1318,12 +1318,31 @@ function requestHost(request, url) {
   return host;
 }
 
+function isLocalHost(host) {
+  return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]" || host.startsWith("127.");
+}
+
 function hostAllowed(cfg, host) {
   if (!/^[a-z0-9.-]+$/.test(host) || host.includes("..")) return false;
   if (cfg.hosts.length === 0 || cfg.hosts.includes("*") || (cfg.hosts.length === 1 && cfg.hosts[0] === "proxy.example.com")) {
     return true;
   }
+  // Reverse proxies and NAT tunnels often rewrite the Host header to a loopback
+  // address. Those requests are authenticated by the capability secret, not by
+  // the Host allowlist, so let local hosts through.
+  if (isLocalHost(host)) return true;
   return cfg.hosts.includes(host) || (cfg.extraHosts || []).includes(host);
+}
+
+// The domain Telegram sees. When a tunnel rewrites the Host header to a
+// loopback address, fall back to the first configured hostname so the bridge
+// page tells the client to connect back to the public domain, not 127.0.0.1.
+function publicHost(cfg, host) {
+  if (isLocalHost(host)) {
+    const configured = (cfg.hosts || []).filter((h) => h !== "*" && h !== "proxy.example.com");
+    if (configured.length > 0) return configured[0];
+  }
+  return host;
 }
 
 async function deriveSecret(cfg, label) {
@@ -1339,28 +1358,45 @@ async function bridgeMode(cfg, host, capability, port) {
   const incomingPort = port ? parseInt(port, 10) : 443;
   const isKnownPort = cfg.ports.includes(incomingPort);
 
+  // Telegram signs the capability with the public domain, but a reverse proxy or
+  // tunnel may rewrite the Host header to a loopback address. Verify against the
+  // request host plus every configured hostname so both setups work.
+  const verifyHosts = [host];
+  for (const h of cfg.hosts || []) {
+    if (h && h !== "*" && h !== "proxy.example.com" && !verifyHosts.includes(h)) verifyHosts.push(h);
+  }
+  for (const h of cfg.extraHosts || []) {
+    if (h && !verifyHosts.includes(h)) verifyHosts.push(h);
+  }
+
   if (isKnownPort && cfg.portSecrets?.[incomingPort]) {
     const pKeys = cfg.portSecrets[incomingPort].keys;
-    const contexts = incomingPort === 443
-      ? [te.encode("tdesktop-web-proxy-bridge-v1\n" + host)]
-      : [
-          te.encode(`tdesktop-web-proxy-bridge-v1\n${host}:${incomingPort}`),
-          te.encode("tdesktop-web-proxy-bridge-v1\n" + host)
-        ];
-    for (const ctx of contexts) {
-      for (const key of pKeys) {
-        if (await crypto.subtle.verify("HMAC", key, provided, ctx)) {
-          return PORT_MODE_BASE + cfg.ports.indexOf(incomingPort);
+    for (const vh of verifyHosts) {
+      const contexts = incomingPort === 443
+        ? [te.encode("tdesktop-web-proxy-bridge-v1\n" + vh)]
+        : [
+            te.encode(`tdesktop-web-proxy-bridge-v1\n${vh}:${incomingPort}`),
+            te.encode("tdesktop-web-proxy-bridge-v1\n" + vh)
+          ];
+      for (const ctx of contexts) {
+        for (const key of pKeys) {
+          if (await crypto.subtle.verify("HMAC", key, provided, ctx)) {
+            return PORT_MODE_BASE + cfg.ports.indexOf(incomingPort);
+          }
         }
       }
     }
   }
 
-  const candidateHosts = [host];
+  const candidateHosts = [];
   const candidatePorts = [];
   if (port && port !== "443" && port !== "80") candidatePorts.push(port);
   for (const p of cfg.ports) if (p !== cfg.ports[0] && !candidatePorts.includes(String(p))) candidatePorts.push(String(p));
-  for (const p of candidatePorts) candidateHosts.push(`${host}:${p}`);
+  for (const vh of verifyHosts) if (!candidateHosts.includes(vh)) candidateHosts.push(vh);
+  for (const p of candidatePorts) for (const vh of verifyHosts) {
+    const ch = `${vh}:${p}`;
+    if (!candidateHosts.includes(ch)) candidateHosts.push(ch);
+  }
 
   for (const h of candidateHosts) {
     const context = te.encode("tdesktop-web-proxy-bridge-v1\n" + h);
@@ -1376,15 +1412,17 @@ async function bridgeMode(cfg, host, capability, port) {
       const p = cfg.ports[idx];
       if (p === incomingPort) continue;
       const pKeys = cfg.portSecrets[p].keys;
-      const contexts = [
-        te.encode(`tdesktop-web-proxy-bridge-v1\n${host}:${p}`),
-        te.encode("tdesktop-web-proxy-bridge-v1\n" + host)
-      ];
-      for (const ctx of contexts) {
-        for (const key of pKeys) {
-          if (await crypto.subtle.verify("HMAC", key, provided, ctx)) {
-            if (!port || port === String(cfg.ports[0]) || port === String(p)) {
-              return PORT_MODE_BASE + idx;
+      for (const vh of verifyHosts) {
+        const contexts = [
+          te.encode(`tdesktop-web-proxy-bridge-v1\n${vh}:${p}`),
+          te.encode("tdesktop-web-proxy-bridge-v1\n" + vh)
+        ];
+        for (const ctx of contexts) {
+          for (const key of pKeys) {
+            if (await crypto.subtle.verify("HMAC", key, provided, ctx)) {
+              if (!port || !isKnownPort || port === String(cfg.ports[0]) || port === String(p)) {
+                return PORT_MODE_BASE + idx;
+              }
             }
           }
         }
@@ -1796,7 +1834,13 @@ function notFound() {
 async function serveBridge(cfg, host, mode, port) {
   const nonce = b64uEncode(crypto.getRandomValues(new Uint8Array(18)));
   const bootstrap = await issueToken(cfg, TOKEN_KIND_BOOTSTRAP, cfg.bootstrapTtl, mode);
-  const authority = (port && port !== "443" && port !== "80") ? `${host}:${port}` : host;
+  // Derive the public port from the negotiated mode, not the request's internal
+  // port: a tunnel may forward an external port (e.g. 443) to an internal one
+  // (e.g. 8080), and the client must dial back to the external port.
+  const portNum = (mode >= PORT_MODE_BASE && mode < PORT_MODE_BASE + cfg.ports.length)
+    ? cfg.ports[mode - PORT_MODE_BASE]
+    : (port ? parseInt(port, 10) : cfg.ports[0]);
+  const authority = (portNum && portNum !== 443 && portNum !== 80) ? `${host}:${portNum}` : host;
   const relayBase = JSON.stringify("https://" + authority + "/");
   const body = BRIDGE_HTML
     .replaceAll("__NONCE__", nonce)
@@ -2514,6 +2558,9 @@ async function handleRequest(request, env, ctx) {
         if (url.pathname === "/") return await serveSetup(host, env, lang, request.method);
         return notFound();
       }
+      // The domain Telegram actually dials. When a tunnel rewrites the Host
+      // header to a loopback address, this falls back to the configured hostname.
+      const pub = publicHost(cfg, host);
       // Configured with SECRET only (older setup, no ADMIN_KEY yet): the site stays
       // camouflaged, but /setup explains how to add ADMIN_KEY. It reveals no secret.
       if (!cfg.adminKey && url.pathname === "/setup") return await serveSetup(host, env, lang, request.method);
@@ -2522,8 +2569,8 @@ async function handleRequest(request, env, ctx) {
       // Admin status & logs: https://host/<ADMIN_KEY>/status  (?probe=1 runs a DC check)
       if (request.method === "GET") {
         const route = panelRoute(url, cfg);
-        if (route === "status") return await serveStatus(cfg, host, lang, url.searchParams.get("probe") === "1");
-        if (route === "panel") return await servePanel(cfg, host, port, lang);
+        if (route === "status") return await serveStatus(cfg, pub, lang, url.searchParams.get("probe") === "1");
+        if (route === "panel") return await servePanel(cfg, pub, port, lang);
       }
 
       // Legacy per-domain secret generator (ACCEPT_GENERATED); also gated by ADMIN_KEY.
@@ -2532,7 +2579,7 @@ async function handleRequest(request, env, ctx) {
         if (!cfg.generatorEnabled || !cfg.adminKey || !label || !safeEqual(url.searchParams.get("key") || "", cfg.adminKey)) {
           return await decoy(cfg.decoyUrl, request.method);
         }
-        return await serveSecret(cfg, host, label, port);
+        return await serveSecret(cfg, pub, label, port);
       }
 
       // Active Probing Defense & Authentic Web Assets (GFW / TSPU scanner camouflage)
@@ -2565,10 +2612,10 @@ async function handleRequest(request, env, ctx) {
         if (keys.length !== 1 || keys[0] !== "bridge" || bridges.length !== 1) return notFound();
         const mode = await bridgeMode(cfg, host, bridges[0], port);
         if (mode < 0) return notFound();
-        return await serveBridge(cfg, host, mode, port);
+        return await serveBridge(cfg, pub, mode, port);
       }
       if (url.pathname === cfg.sessionPath || url.pathname === "/api/v1/session") return await serveSession(request, cfg);
-      if (url.pathname === cfg.wsPath || url.pathname === "/api/v1/ws") return await serveWebSocket(request, cfg, host, port);
+      if (url.pathname === cfg.wsPath || url.pathname === "/api/v1/ws") return await serveWebSocket(request, cfg, pub, port);
       return await decoy(cfg.decoyUrl, request.method);
 }
 
@@ -2696,7 +2743,7 @@ async function handleUpgrade(req, socket, head) {
       socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
       return;
     }
-    const response = await serveWebSocket(request, cfg, host, port);
+    const response = await serveWebSocket(request, cfg, publicHost(cfg, host), port);
     const client = response && response.webSocket;
     const marker = client && client._serverWebSocket;
     if (!marker) {
