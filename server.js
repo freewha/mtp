@@ -1349,9 +1349,10 @@ async function buildRuntime(cfg) {
       } else {
         sBytes = (await sha256(concat(te.encode("proxygosha-port-secret-v1\n"), base, te.encode("\n" + p)))).slice(0, 16);
       }
+      const hex = bytesToHex(sBytes);
       portSecrets[p] = {
         secret: sBytes,
-        secretHex: "dd" + bytesToHex(sBytes),
+        secretHex: hex.startsWith("dd") ? hex : "dd" + hex,
         keys: [
           await importHmac(sBytes, ["verify"]),
           await importHmac(concat(Uint8Array.of(0xdd), sBytes), ["verify"])
@@ -1697,7 +1698,8 @@ async function servePanel(cfg, host, port, lang) {
   STATS.panelViews++;
   logEvent("panel_view", host);
   const statusHref = "/" + encodeURIComponent(cfg.adminKey) + "/status";
-  const secret = "dd" + bytesToHex(cfg.base);
+  const baseHex = bytesToHex(cfg.base);
+  const secret = baseHex.startsWith("dd") ? baseHex : "dd" + baseHex;
   const hosts = [];
   for (const h of [host, ...(cfg.extraHosts || [])]) if (h && !hosts.includes(h)) hosts.push(h);
   const sections = hosts.map((h) => {
@@ -2485,7 +2487,9 @@ class WsSession {
       }
       const payload = bytes.subarray(offset + 8, end);
       offset = end;
-      if (this.laneId && id !== this.laneId) {
+      // Lane sockets carry exactly one stream; PING/PONG are control frames and
+      // always use id 0, so they must be exempt from the lane id check.
+      if (this.laneId && id !== 0 && id !== this.laneId) {
         this.shutdown();
         return;
       }
