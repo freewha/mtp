@@ -1178,9 +1178,10 @@ function parseSecret(hexValue) {
   let hex = String(hexValue).trim().toLowerCase();
   if (hex.startsWith("0x")) hex = hex.substring(2);
   if (!/^[0-9a-f]+$/.test(hex)) return null;
-  // Telegram uses the secret exactly as typed into the link (17 bytes when the
-  // "dd" prefix is present, 16 bytes otherwise), so the value is never trimmed.
-  if (hex.length === 32 || hex.length === 34) return hexToBytes(hex);
+  // The raw 16-byte secret. A "dd" prefix is only a link/display convention and
+  // is stripped here, exactly like the original worker.js.
+  if (hex.length === 34 && hex.startsWith("dd")) return hexToBytes(hex.substring(2));
+  if (hex.length === 32) return hexToBytes(hex);
   return null;
 }
 
@@ -1349,10 +1350,9 @@ async function buildRuntime(cfg) {
       } else {
         sBytes = (await sha256(concat(te.encode("proxygosha-port-secret-v1\n"), base, te.encode("\n" + p)))).slice(0, 16);
       }
-      const hex = bytesToHex(sBytes);
       portSecrets[p] = {
         secret: sBytes,
-        secretHex: hex.startsWith("dd") ? hex : "dd" + hex,
+        secretHex: bytesToHex(sBytes),
         keys: [
           await importHmac(sBytes, ["verify"]),
           await importHmac(concat(Uint8Array.of(0xdd), sBytes), ["verify"])
@@ -1698,8 +1698,7 @@ async function servePanel(cfg, host, port, lang) {
   STATS.panelViews++;
   logEvent("panel_view", host);
   const statusHref = "/" + encodeURIComponent(cfg.adminKey) + "/status";
-  const baseHex = bytesToHex(cfg.base);
-  const secret = baseHex.startsWith("dd") ? baseHex : "dd" + baseHex;
+  const secret = bytesToHex(cfg.base);
   const hosts = [];
   for (const h of [host, ...(cfg.extraHosts || [])]) if (h && !hosts.includes(h)) hosts.push(h);
   const sections = hosts.map((h) => {
