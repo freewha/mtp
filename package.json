@@ -1,0 +1,13 @@
+{
+  "name": "proxygosha",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Node.js port of the ProxyGosha Telegram web proxy (MTProto over WebSocket).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.23.0"
+  }
+}
